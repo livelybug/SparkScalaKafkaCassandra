@@ -1,0 +1,7 @@
+Zookeeper
+C:\Users\Burt>zkserver
+
+Kafka
+E:\MyFiles\Work_document\BigData\Tools\kafka_2.10-0.10.0.0>.\bin\windows\kafka-server-start.bat .\config\server.properties
+E:\MyFiles\Work_document\BigData\Tools\kafka_2.10-0.10.0.0\bin\windows>kafka-console-producer.bat --broker-list localhost:9092 --topic test < ..\..\tests\access.txt
+E:\MyFiles\Work_document\BigData\Tools\kafka_2.10-0.10.0.0\bin\windows>kafka-console-consumer.bat --zookeeper localhost:2181 --topic test
