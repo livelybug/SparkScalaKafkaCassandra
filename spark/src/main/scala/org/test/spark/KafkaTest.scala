@@ -12,13 +12,22 @@ import Utilities._
 import org.apache.spark.streaming.kafka._
 import kafka.serializer.StringDecoder
 
+import com.datastax.spark.connector._
+import scala.util.Try
+import org.joda.time.DateTime
+
 /** listening for log data from Kafka's test topic on default port 9092. */
 object KafkaExample {
   
   def main(args: Array[String]) {
 
+    val conf = new SparkConf(true)
+        .set("spark.cassandra.connection.host", "127.0.0.1")
+        .setMaster("local[*]")
+        .setAppName("KafkaCassandraTest")
+        
     // context with a 1 second batch interval
-    val ssc = new StreamingContext("local[*]", "KafkaExample", Seconds(1))
+    val ssc = new StreamingContext(conf, Seconds(1))
     
     setupLogging()
     
@@ -42,7 +51,7 @@ object KafkaExample {
     
     // Map these status results to success and failure
     val successFailure = statuses.map(x => {
-      val statusCode = util.Try(x.toInt) getOrElse 0
+      val statusCode = Try(x.toInt) getOrElse 0
       if (statusCode >= 200 && statusCode < 300) {
         "Success"
       } else if (statusCode >= 500 && statusCode < 600) {
@@ -52,8 +61,8 @@ object KafkaExample {
       }
     })
     
-    // Wrap up statuses over a 0.5 minute window sliding every 10 second
-    val statusCounts = successFailure.countByValueAndWindow(Seconds(30), Seconds(10))
+    // Wrap up statuses over a 5 sec window sliding every 1 second
+    val statusCounts = successFailure.countByValueAndWindow(Seconds(5), Seconds(1))
     
     var succErrNum = 0;
     var succVcNum = 0;
@@ -63,20 +72,26 @@ object KafkaExample {
       // Keep track of total success and error codes from each RDD
       var totalSuccess:Long = 0
       var totalError:Long = 0
+      var totalOther:Long = 0
 
       if (rdd.count() > 0) {
         succVcNum = 0
         val elements = rdd.collect()
+        
         for (element <- elements) {
           val result = element._1
           val count = element._2
           if (result == "Success") {
             totalSuccess += count
           }
-          if (result == "Failure") {
+          else if (result == "Failure") {
             totalError += count
           }
+          else {
+            totalOther += count
+          }
         }
+        
       } else {
         succVcNum += 1
         println("no data")
@@ -85,12 +100,13 @@ object KafkaExample {
       }
 
       println("Total success: " + totalSuccess + " Total failure: " + totalError)
+      rdd.map( x => ((new DateTime(time.milliseconds)).toString(), totalSuccess, totalError, totalOther)).saveToCassandra("mykeyspace1", "logstatus", SomeColumns("datetime", "success", "failure", "other"))
       
       // Don't alarm unless we have some minimum amount of data to work with
       if (totalError + totalSuccess > 100) {
         // Compute the error rate
         // use of util.Try to handle potential divide by zero exception
-        val ratio:Double = util.Try( totalError.toDouble / totalSuccess.toDouble ) getOrElse 1.0
+        val ratio:Double = Try( totalError.toDouble / totalSuccess.toDouble ) getOrElse 1.0
         // If there are more errors than successes, wake someone up
         if (ratio > 0.5) {
           succErrNum += 1
