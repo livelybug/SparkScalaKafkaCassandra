@@ -8,7 +8,7 @@ E:\MyFiles\Work_document\BigData\Tools\kafka_2.10-0.10.0.0\bin\windows>kafka-con
 
 Cassandra
 CREATE TABLE logstatus (
-  datetime text PRIMARY KEY,
+  datetime timestamp PRIMARY KEY,
   success bigint,
   failure bigint,
   other bigint
