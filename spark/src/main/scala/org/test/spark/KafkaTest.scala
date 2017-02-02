@@ -1,158 +1,109 @@
 package org.test.spark
 
 /*why must put the kafka.serializer at the beginning???!!!*/
-import kafka.serializer.StringDecoder
+//import kafka.serializer.StringDecoder
 /*why must put the kafka.serializer at the beginning???!!!*/
 
-import org.apache.spark._
-import org.apache.spark.SparkContext._
-import org.apache.spark.sql._
-import org.apache.log4j._
-import org.apache.spark.sql.functions._
-import org.apache.spark.streaming._
+import org.apache.spark.sql.functions.{when, window}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.streaming.OutputMode
+
+/*
+import org.apache.spark.streaming.kafka010._
+import org.apache.spark.sql.kafka010._
+import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
+import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
+import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.common.serialization.StringDeserializer
+import com.datastax.spark.connector._
+*/
+import Utilities._
 
 import java.util.regex.Pattern
 import java.util.regex.Matcher
-
-import Utilities._
-
-import org.apache.spark.streaming.kafka._
-
-import com.datastax.spark.connector._
+import java.util.Locale
+import java.sql.Timestamp
+import java.text.SimpleDateFormat
 import scala.util.Try
-import org.joda.time.DateTime
-import org.apache.spark.rdd.RDD
 
 /** listening for log data from Kafka's test topic on default port 9092. */
 object KafkaExample {
 
-  // structured data for one line log
-  case class LogEntry(ip:String, client:String, user:String, dateTime:String, request:String, status:String, bytes:String, referer:String, agent:String, count:Long)    
-
-  // regular expression (regex) to extract fields from raw Apache log lines
   val pattern = apacheLogPattern()
-    
-  def parseLog(dIn:(String, Long)) : LogEntry = {     
-     val x:String = dIn._1 
-     val count:Long = dIn._2
+  val datePattern = Pattern.compile("\\[(.*?) .+]")    
+ 
+  def parseDateField(field: String): Option[Timestamp] = {
+      val dateMatcher = datePattern.matcher(field)
+      if (dateMatcher.find) {
+              val dateString = dateMatcher.group(1)
+              val dateFormat = new SimpleDateFormat("dd/MMM/yyyy:HH:mm:ss", Locale.ENGLISH)
+              val date = (dateFormat.parse(dateString))
+              val timestamp = new Timestamp(date.getTime());
+              //return Option(timestamp.toString())    //String can also be recognized as timestamp by sql.functions.window
+              Option(timestamp)
+          } else {
+          None
+      }
+   } 
+  
+  case class LogEntry(ip:String, client:String, user:String, dateTime:Timestamp, request:String, status:Int, bytes:String, referer:String, agent:String)
+  def parseLog(dIn:String) : Option[LogEntry] = {
+     val x:String = dIn
      val matcher:Matcher = pattern.matcher(x);
      if (matcher.matches()) {
-       return LogEntry(
+       Option(LogEntry(
            matcher.group(1),
            matcher.group(2),
            matcher.group(3),
-           matcher.group(4),
+           parseDateField(matcher.group(4)).getOrElse(null),
            matcher.group(5),
-           matcher.group(6),
+           Try(matcher.group(6).toInt) getOrElse(0),
            matcher.group(7),
            matcher.group(8),
-           matcher.group(9),
-           count
-           )
+           matcher.group(9)
+           ))
      } else {
-       return LogEntry("", "", "", "", "", "9999", "", "", "", 0)
+       None
      }
    } 
   
-  /** Lazily instantiated singleton instance of SparkSession */
-  object SparkSessionSingleton {
-  
-    @transient  private var instance: SparkSession = _
-  
-    def getInstance(sparkConf: SparkConf): SparkSession = {
-      if (instance == null) {
-        instance = SparkSession
-          .builder
-          .config(sparkConf)
-          .getOrCreate()
-      }
-      instance
-    }
-  }  
-  
-  
   def main(args: Array[String]) {
-
-    val conf = new SparkConf(true)
-        .set("spark.cassandra.connection.host", "127.0.0.1")
-        .setMaster("local[*]")
-        .setAppName("KafkaCassandraTest")
-        
-    // context with a 1 second batch interval
-    val ssc = new StreamingContext(conf, Seconds(1))
     
-    setupLogging()
+    val spark = SparkSession
+      .builder
+      .appName("SparkSQL")
+      .master("local[*]")
+      .getOrCreate()    
 
-    // hostname:port for Kafka brokers
-    val kafkaParams = Map("metadata.broker.list" -> "localhost:9092")
-    // List of topics you want to listen for from Kafka
-    val topics = List("test").toSet
-    // Create Kafka stream, which will contain (topic,message) pairs.
-    // map(_._2) at the end in order to only get the messages, individual lines of data.
-    val lines = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](ssc, kafkaParams, topics).map(_._2)
-             
-
-    var succVcNum = 0;
-    var succErrNum = 0;
-    //val statuses = lines.foreachRDD{ (rdd, time) =>
-    //.foreachRDD{ (rdd: RDD[String], time: Time) =>    
-    lines.countByValueAndWindow(Seconds(5), Seconds(1)).foreachRDD{ (rdd, time) =>
-      val spark = SparkSessionSingleton.getInstance(rdd.sparkContext.getConf)
-      import spark.implicits._
-      val dsLog = rdd.map(parseLog).toDS().cache()
+    setupLogging()      
       
-      val dsLog2 = dsLog.select(dsLog("count"),
-        when(dsLog("status").between(500, 599), "Failure")
-        .when(dsLog("status").between(200, 299), "Success")
-        .otherwise("Other").as("status")
-        ).groupBy("status").agg(sum('count) as "count").cache()
-      
-      if(dsLog2.count() > 0) {
-        dsLog2.show()
-        succVcNum = 0;
+    import spark.implicits._
+    val lines = spark.readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", "localhost:9092")
+      .option("subscribe", "test")
+      .load()
+      .selectExpr("CAST(value AS STRING)")
+      .as[String]
 
-        def getStatusNum(sta: String):Long =  {
-          val query = s"status = '$sta'"
-          Try(dsLog2.select(dsLog2("count")).where(query).first().getAs[Long](0)) getOrElse 0
-        }
+    val dsRaw = lines.map(line => parseLog(line).getOrElse(null))
+        .withWatermark("dateTime", "3 hours")
+        .select(when($"status".between(500, 599), "Failure")
+          .when($"status".between(200, 299), "Success")
+          .otherwise("Other").as("status"), $"dateTime")
+        .groupBy($"status", window($"dateTime", "2 hours", "2 hours").as("dt"))
+        .count().orderBy("dt")
 
-        val totalSuccess:Long = getStatusNum("Success")
-        val totalError:Long = getStatusNum("Failure")
-        val totalOther:Long = getStatusNum("Other")
-        
-        val tupleTmp = (
-            (new DateTime(time.milliseconds)).toString(), 
-            totalSuccess, totalError, totalOther
-        )
-        
-        spark.sparkContext.parallelize(Seq((tupleTmp))).
-          saveToCassandra("mykeyspace1", "logstatus", SomeColumns("datetime", "success", "failure", "other"))          
-       
-        // Don't alarm unless we have some minimum amount of data to work with
-        if(totalError + totalSuccess + totalOther > 100) {
-          val ratio:Double = Try(( totalError.toDouble + totalOther) / totalSuccess.toDouble ) getOrElse 1.0
-          // If there are too many errors , wake someone up
-          if (ratio > 0.3) {
-            succErrNum += 1
-            if(succErrNum >4) 
-              println("Wake somebody up! Something is horribly wrong.")  //we can send email here, but lower than a certain frequency, like 30 mins a mail 
-          } else {
-            succErrNum = 0
-            println("All systems go.")
-          }
-        }
-          
-      } else {
-        succVcNum += 1;
-        println("no data")
-        if(succVcNum > 10)
-          println("no data alarm")        
-      }
-   }
-    
-    ssc.checkpoint("C:/checkpoint/")
-    ssc.start()
-    ssc.awaitTermination()
+    import org.apache.spark.sql.streaming.ProcessingTime
+    import scala.concurrent.duration._
+    val query = dsRaw.writeStream          
+      .trigger(ProcessingTime(1.seconds))
+      .outputMode(OutputMode.Complete())  //.outputMode("complete")
+      .format("console")
+      .start()
+
+    query.awaitTermination()
+
   }
 }
 
